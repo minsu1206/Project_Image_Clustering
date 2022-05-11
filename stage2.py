@@ -1,5 +1,6 @@
 from copy import deepcopy
 import json
+from pydoc import apropos
 import torch
 import torch.nn as nn
 import torchvision as tv
@@ -13,7 +14,7 @@ import numpy as np
 import torch.nn.functional as F
 from tqdm import tqdm
 from random import sample
-
+import matplotlib.pyplot as plt
 
 # --------------------------------------------------------------------- #
 # Global Level Setting
@@ -97,8 +98,24 @@ class BD_TestDataset(Dataset):
         img_names = self.tag_img_dict[key]
 
         imgs = []
+        imgs_names = []
         for img_name in img_names:
             img = cv2.imread(self.data_path, img_name + '.jpg')
+            if img is None:
+                continue
+            
+            img = Image.fromarray(np.uint8(img)).convert('RGB')
+
+            if self.transforms is not None:
+                img = self.transforms(img)
+            
+            imgs_names.append(img_name + '.jpg')
+            imgs.append(img)
+        
+        if self.transforms is not None:
+            return torch.tensor(imgs), imgs_names, key
+        else:
+            return imgs, imgs_names, key
 
 
 class ResNetWrapper(nn.Module):
@@ -180,6 +197,38 @@ class ClsOneHot:
         for x_ in x:
             result.append(self.tag_list.index(x_))
         return torch.tensor(result, dtype=torch.int64).view(-1)
+
+
+def compute_distance(batch_tensors):
+    batch = batch_tensors.shape[0]
+    distance_list = []
+    pair_list = []
+    for i in range(batch):
+        anchor = batch_tensors[i]
+        for j in range(i+1, batch):
+            compare = batch_tensors[j]
+            distance = F.pairwise_distance(anchor, compare)
+            distance_list.append(distance)
+            pair_list.append((i, j))
+
+    topk_distance = torch.topk(torch.tensor(distance_list), k=4)
+    topk_pair = torch.tensor(pair_list)[topk_distance.indices]
+
+    return topk_distance, topk_pair
+
+def visualize_imgs(imgs, data_path, key):
+    w = 10
+    h = 10
+    fig = plt.figure(figsize=(8, 8))
+    columns = 2
+    rows = 2
+    for i in range(len(imgs)):
+        img = cv2.imread(os.path.join(data_path, imgs[i]))
+        fig.add_subplot(rows, columns, i)
+        plt.imshow(img)
+    
+    # plt.show()
+    plt.savefig(f'viz_{key}.jpg')
 
 
 # --------------------------------------------------------------------- #
@@ -268,22 +317,78 @@ def train():
         if epoch_ and epoch_ % save_period == 0:
             torch.save(model.state_dict, f'model_{epoch_}.pth')
 
+    return model
 
 # --------------------------------------------------------------------- #
 # My own code for test
 # --------------------------------------------------------------------- #
 
-def test():
-    pass
+def test(trained_model=None):
+    
+
+    # Build test dataset 
+    with open('tag_n_photoid.json', 'r') as f:
+        tag_n_photoid = json.load(f)
+
+    img_data_path = 'Photo_new'
+
+    logger = get_logger('BigDataMidTerm_EVAL')
+
+    transform = tv.transforms.Compose([
+        tv.transforms.Resize((224, 224)),
+        tv.transforms.ToTensor(),
+        tv.transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+    ])
+
+    test_dataset = BD_TestDataset(img_data_path, tag_n_photoid, transforms=transform)
 
 
+    # Load trained model
+    if trained_model is not None:
+        model = trained_model
+    else:
+        unique_tags = 173 # already checked at train()
+        model = tv.models.resnet50(pretrained=True, progress=True)
+        model = ResNetWrapper(backbone=model, n_cls=len(unique_tags))
 
+    model.to(DEVICE)
+
+    for i in range(len(test_dataset)):
+        test_imgs, test_names, test_key = test_dataset[i]
+        test_imgs.to(DEVICE)
+        eval_feats, _ = model(test_imgs)
+        topk_dist, topk_pair = compute_distance(eval_feats, k=min(len(test_imgs), 4))
+
+        if len(topk_dist) == 4:
+            visualize_imgs(test_names, topk_pair)
+                
+        logger.info(f'EVAL {test_key} : {topk_dist}')
 
 
 
 
 if __name__ == "__main__":
-    train()
-    # test()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--train', action='store_true')
+    parser.add_argument('--eval', action='store_true')
+    parser.add_argument('--load', type=str, default='')
+
+    opt = parser.parse_args()
+
+    if opt.train:
+        if opt.load:
+            # TODO : resume training 
+            pass
+        model_ = train()
+    if opt.test:
+        if opt.load:
+            # TODO : load trained model
+            pass
+        test(trained_model=None)
+        # FIXME
+    
+
+
 
 
