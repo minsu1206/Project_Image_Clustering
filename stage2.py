@@ -82,40 +82,65 @@ class BD_Dataset(Dataset):
 
 
 class BD_TestDataset(Dataset):
-    def __init__(self, data_path, tag_img_dict, transforms=None):
+    # TODO : 
+    # [x] diff among same class 
+    # [ ] diff btw two classes 
+    def __init__(self, data_path, tag_img_dict, transforms=None, batch=8, mode='SAME'):
         super().__init__()
         self.data_path = data_path
         self.tag_img_dict = tag_img_dict        
         self.transforms = transforms
+        self.buffer = None
+        self.batch = batch 
+        assert mode in ['SAME', 'DIFF']
+        self.mode = mode
 
     def __len__(self):
         return len(list(self.tag_img_dict.keys()))
 
     def __getitem__(self, idx):
-        
-        key = list(self.tag_img_dict.keys())[idx]
+        if self.mode == 'SAME':
+            # Solve Memory problem --> Set buffer and slice! 
+            if self.buffer is None:
+                key = list(self.tag_img_dict.keys())[idx]
 
-        img_names = self.tag_img_dict[key]
+                img_names = self.tag_img_dict[key]
+                if len(img_names) > self.batch:     #set buffer
+                    self.buffer = {"img":img_names[self.batch:], "key": key}
+                    img_names = img_names[:self.batch]
+                else:
+                    self.buffer = None
+            else:
+                img_names = self.buffer['img'][:self.batch]
+                key = self.buffer["key"]
+                if len(self.buffer["img"]) <= self.batch:
+                    self.buffer = None
+                else:
+                    self.buffer["img"] = self.buffer["img"][self.batch:]
 
-        imgs = []
-        imgs_names = []
-        for img_name in img_names:
-            img = cv2.imread(self.data_path, img_name + '.jpg')
-            if img is None:
-                continue
+            imgs_names = []
+            imgs = []
+            for img_name in img_names:
+                img = cv2.imread(os.path.join(self.data_path, str(img_name) + '.jpg'), cv2.IMREAD_COLOR)
+                if img is None:
+                    continue
+                
+                img = Image.fromarray(np.uint8(img)).convert('RGB')
+
+                if self.transforms is not None:
+                    img = self.transforms(img)
+                
+                imgs_names.append(str(img_name) + '.jpg')
+                imgs.append(img)
             
-            img = Image.fromarray(np.uint8(img)).convert('RGB')
-
             if self.transforms is not None:
-                img = self.transforms(img)
-            
-            imgs_names.append(img_name + '.jpg')
-            imgs.append(img)
-        
-        if self.transforms is not None:
-            return torch.tensor(imgs), imgs_names, key
-        else:
-            return imgs, imgs_names, key
+                return torch.stack(imgs), imgs_names, key
+            else:
+                return imgs, imgs_names, key
+        elif self.mode == 'DIFF':
+            # TODO:
+            raise NotImplementedError()
+
 
 
 class ResNetWrapper(nn.Module):
@@ -199,7 +224,7 @@ class ClsOneHot:
         return torch.tensor(result, dtype=torch.int64).view(-1)
 
 
-def compute_distance(batch_tensors):
+def compute_distance(batch_tensors, k=4):
     batch = batch_tensors.shape[0]
     distance_list = []
     pair_list = []
@@ -208,10 +233,12 @@ def compute_distance(batch_tensors):
         for j in range(i+1, batch):
             compare = batch_tensors[j]
             distance = F.pairwise_distance(anchor, compare)
-            distance_list.append(distance)
+            distance = torch.sqrt(distance.sum())
+            distance_list.append(distance.item())
             pair_list.append((i, j))
-
-    topk_distance = torch.topk(torch.tensor(distance_list), k=4)
+    
+    distance_list = torch.tensor(distance_list)
+    topk_distance = torch.topk(distance_list, k=k, largest=False)
     topk_pair = torch.tensor(pair_list)[topk_distance.indices]
 
     return topk_distance, topk_pair
@@ -235,7 +262,7 @@ def visualize_imgs(imgs, data_path, key):
 # My own code for model training
 # --------------------------------------------------------------------- #
 
-def train():
+def train(resume=None):
 
     tag_filtered_path = 'tag_filtered.csv'
     img_data_path = 'Photo_new'
@@ -315,7 +342,7 @@ def train():
         scheduler.step()
 
         if epoch_ and epoch_ % save_period == 0:
-            torch.save(model.state_dict, f'model_{epoch_}.pth')
+            torch.save(model.state_dict(), f'model_{epoch_}.pth')
 
     return model
 
@@ -323,7 +350,7 @@ def train():
 # My own code for test
 # --------------------------------------------------------------------- #
 
-def test(trained_model=None):
+def test(trained_model=None, load=False):
     
 
     # Build test dataset 
@@ -349,20 +376,22 @@ def test(trained_model=None):
     else:
         unique_tags = 173 # already checked at train()
         model = tv.models.resnet50(pretrained=True, progress=True)
-        model = ResNetWrapper(backbone=model, n_cls=len(unique_tags))
-
+        model = ResNetWrapper(backbone=model, n_cls=unique_tags)
+        if load:
+            model.load_state_dict(load)
     model.to(DEVICE)
 
     for i in range(len(test_dataset)):
         test_imgs, test_names, test_key = test_dataset[i]
-        test_imgs.to(DEVICE)
+        test_imgs = test_imgs.to(DEVICE)
         eval_feats, _ = model(test_imgs)
-        topk_dist, topk_pair = compute_distance(eval_feats, k=min(len(test_imgs), 4))
+        topk_dist, topk_pair = compute_distance(eval_feats, 
+                                                k= 4 if len(test_imgs) >= 4 else len(test_imgs) -1)
 
         if len(topk_dist) == 4:
             visualize_imgs(test_names, topk_pair)
                 
-        logger.info(f'EVAL {test_key} : {topk_dist}')
+        logger.info(f'EVAL {test_key} : {topk_dist.values}  PAIR : {topk_pair}')
 
 
 
@@ -381,14 +410,9 @@ if __name__ == "__main__":
             # TODO : resume training 
             pass
         model_ = train()
-    if opt.test:
+    if opt.eval:
+        state_dict=False
         if opt.load:
-            # TODO : load trained model
-            pass
-        test(trained_model=None)
-        # FIXME
+            state_dict = torch.load(opt.load, map_location=DEVICE)
+        test(trained_model=None, load=state_dict)
     
-
-
-
-
