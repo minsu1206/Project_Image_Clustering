@@ -21,10 +21,10 @@ import matplotlib.pyplot as plt
 # --------------------------------------------------------------------- #
 
 DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-# GTX 1060 6GB
+# 1. GTX 1060 6GB
+# 2. GTX 3070Ti 8GB
 
 import logging
-
 
 def get_logger(exp_name='BigDataMidTerm'):
     logger = logging.getLogger(exp_name)
@@ -35,7 +35,7 @@ def get_logger(exp_name='BigDataMidTerm'):
     logger.addHandler(stream_handler)
     import time
     log_time = time.strftime("%Y-%m-%d-%H-%M", time.gmtime())
-    file_handler = logging.FileHandler(f'{exp_name}_{log_time}.log')
+    file_handler = logging.FileHandler(f'log/{exp_name}_{log_time}.log')
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
@@ -47,12 +47,12 @@ logger = get_logger()
 
 # --------------------------------------------------------------------- #
 # My own class & method 
+# - Dataset
 # --------------------------------------------------------------------- #
 
 class BD_Dataset(Dataset):
     def __init__(self, data_path, img_tag_table, transforms=None):
         super().__init__()
-        # self.images = list(glob.glob(os.path.join(data_path, '*.jpg')))
         self.data_path = data_path
         self.img_tag_table = img_tag_table
         self.transforms = transforms
@@ -84,8 +84,8 @@ class BD_Dataset(Dataset):
 class BD_TestDataset(Dataset):
     # TODO : 
     # [x] diff among same class 
-    # [ ] diff btw two classes 
-    def __init__(self, data_path, tag_img_dict, transforms=None, batch=8, mode='SAME'):
+    # [x] diff btw two classes 
+    def __init__(self, data_path, tag_img_dict, transforms=None, batch=16, mode='SAME'):
         super().__init__()
         self.data_path = data_path
         self.tag_img_dict = tag_img_dict        
@@ -118,6 +118,7 @@ class BD_TestDataset(Dataset):
                 else:
                     self.buffer["img"] = self.buffer["img"][self.batch:]
 
+            # prepare data
             imgs_names = []
             imgs = []
             for img_name in img_names:
@@ -133,15 +134,71 @@ class BD_TestDataset(Dataset):
                 imgs_names.append(str(img_name) + '.jpg')
                 imgs.append(img)
             
-            if self.transforms is not None:
-                return torch.stack(imgs), imgs_names, key
-            else:
-                return imgs, imgs_names, key
+            return imgs, imgs_names, key
+
         elif self.mode == 'DIFF':
-            # TODO:
-            raise NotImplementedError()
+            
+            # 1st class (anchor) images selection
+            anchor_key = list(self.tag_img_dict.keys())[idx]
+            anchor_img_names = self.tag_img_dict[anchor_key]
+
+            if len(anchor_img_names) > int(self.batch // 2):
+                anchor_img_names = sample(anchor_img_names, self.batch // 2)
+            else:
+                pass
+
+            # 2nd class (negative) images selection
+            sampling = list(self.tag_img_dict.keys()).remove(anchor_key)
+            negative_key = sample(sampling, 1)
+            negative_img_names = self.tag_img_dict[negative_key]
+            
+            if len(negative_img_names) > int(self.batch // 2):
+                negative_img_names = sample(negative_img_names, self.batch // 2)
+            else:
+                pass
+
+            # prepare anchor data
+            anchor_imgs_names = []
+            anchor_imgs = []
+            for img_name in anchor_img_names:
+                img = cv2.imread(os.path.join(self.data_path, str(img_name) + '.jpg'), cv2.IMREAD_COLOR)
+                if img is None:
+                    continue
+                    
+                img = Image.fromarray(np.uint8(img)).convert('RGB')
+
+                if self.transforms is not None:
+                    img = self.transforms(img)
+                
+                anchor_imgs_names.append(str(img_name) + '.jpg')
+                anchor_imgs.append(img)
+
+            # prepare negative data
+            negative_imgs_names = []
+            negative_imgs = []
+            for img_name in negative_img_names:
+                img = cv2.imread(os.path.join(self.data_path, str(img_name) + '.jpg'), cv2.IMREAD_COLOR)
+                if img is None:
+                    continue
+                    
+                img = Image.fromarray(np.uint8(img)).convert('RGB')
+
+                if self.transforms is not None:
+                    img = self.transforms(img)
+
+                negative_imgs_names.append(str(img_name) + '.jpg')
+                negative_imgs.append(img)
 
 
+            return anchor_imgs, negative_imgs, anchor_imgs_names, negative_imgs_names, \
+                    anchor_key, negative_key
+
+
+
+# --------------------------------------------------------------------- #
+# My own class & method 
+# - Model
+# --------------------------------------------------------------------- #
 
 class ResNetWrapper(nn.Module):
     def __init__(self, backbone, n_cls):
@@ -174,6 +231,11 @@ class ResNetWrapper(nn.Module):
         cls_vec = self.fc(feat_vec.reshape(x.size(0), -1))
         return feat_vec, cls_vec
 
+
+# --------------------------------------------------------------------- #
+# My own class & method 
+# - Loss
+# --------------------------------------------------------------------- #
 
 class ContrastiveLoss(nn.Module):
     def __init__(self, margin=1.5):
@@ -212,6 +274,11 @@ class MultiContrastiveLoss(nn.Module):
         return loss / self.dim
 
 
+# --------------------------------------------------------------------- #
+# My own class & method 
+# - Utils
+# --------------------------------------------------------------------- #
+
 class ClsOneHot:
     def __init__(self, tag_list):
         self.tag_list = tag_list 
@@ -224,7 +291,7 @@ class ClsOneHot:
         return torch.tensor(result, dtype=torch.int64).view(-1)
 
 
-def compute_distance(batch_tensors, k=4):
+def compute_distance_same(batch_tensors, k=4):
     batch = batch_tensors.shape[0]
     distance_list = []
     pair_list = []
@@ -238,25 +305,87 @@ def compute_distance(batch_tensors, k=4):
             pair_list.append((i, j))
     
     distance_list = torch.tensor(distance_list)
-    topk_distance = torch.topk(distance_list, k=k, largest=False)
-    topk_pair = torch.tensor(pair_list)[topk_distance.indices]
+    # closest images
+    topk_distance_close = torch.topk(distance_list, k=k, largest=False)
+    topk_pair_close = torch.tensor(pair_list)[topk_distance_close.indices]
 
-    return topk_distance, topk_pair
+    return topk_distance_close, topk_pair_close
 
-def visualize_imgs(imgs, data_path, key):
-    w = 10
-    h = 10
+
+def compute_distance_diff(anchor_tensors, negative_tensors, k=4):
+    batch1 = anchor_tensors.shape[0]
+    batch2 = negative_tensors.shape[1]
+
+    distance_list = []
+    pair_list = []
+    for i in range(batch1):
+        anchor = anchor_tensors[i]
+        for j in range(batch2):
+            negative = anchor_tensors[j]
+            distance = F.pairwise_distance(anchor, negative)
+            distance = torch.sqrt(distance.sum())
+            distance_list.append(distance.item())
+            pair_list.append((i, j))
+        
+    distance_list = torch.tensor(distance_list)
+    distance_mean = torch.mean(distance_list)
+    distance_std = torch.mean(distance_list)
+    topk_distance_close = torch.topk(distance_list, k=k, largest=False)
+    topk_pair_close = torch.tensor(pair_list)[topk_distance_close.indices]
+
+    return topk_distance_close, topk_pair_close, distance_mean, distance_std
+
+
+def visualize_imgs(imgs_names, img_pairs, data_path, key):
+
     fig = plt.figure(figsize=(8, 8))
     columns = 2
-    rows = 2
-    for i in range(len(imgs)):
-        img = cv2.imread(os.path.join(data_path, imgs[i]))
-        fig.add_subplot(rows, columns, i)
+    rows = len(img_pairs)
+    for i in range(len(img_pairs)):
+        img = cv2.imread(os.path.join(data_path, imgs_names[img_pairs[i][0]]))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        fig.add_subplot(rows, columns, 2*i+1)
         plt.imshow(img)
-    
-    # plt.show()
-    plt.savefig(f'viz_{key}.jpg')
+        img = cv2.imread(os.path.join(data_path, imgs_names[img_pairs[i][1]]))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        fig.add_subplot(rows, columns, 2*i+2)
+        plt.imshow(img)
 
+    # plt.show()
+    if os.path.exists(f'{VIZ_PATH}/viz_{key}.jpg'):
+        count = 2
+        while os.path.exists(f'{VIZ_PATH}/viz_{key}_{count}.jpg'):
+            count += 1
+        plt.savefig(f'{VIZ_PATH}/viz_{key}_{count}.jpg')
+    else:
+        plt.savefig(f'{VIZ_PATH}/viz_{key}.jpg')
+
+
+VIZ_PATH = 'visualize'
+
+def visualize_imgs2(anchor_names, negative_names, img_pairs, data_path, key1, key2):
+
+    fig = plt.figure(figsize=(8, 8))
+    columns = 2
+    rows = len(img_pairs)
+    for i in range(len(img_pairs)):
+        img = cv2.imread(os.path.join(data_path, anchor_names[img_pairs[i][0]]))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        fig.add_subplot(rows, columns, 2*i+1)
+        plt.imshow(img)
+        img = cv2.imread(os.path.join(data_path, negative_names[img_pairs[i][1]]))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        fig.add_subplot(rows, columns, 2*i+2)
+        plt.imshow(img)
+
+    # plt.show()
+    if os.path.exists(f'{VIZ_PATH}/viz_{key1}_{key2}.jpg'):
+        count = 2
+        while os.path.exists(f'{VIZ_PATH}/viz_{key1}_{key2}_{count}.jpg'):
+            count += 1
+        plt.savefig(f'{VIZ_PATH}/viz_{key1}_{key2}_{count}.jpg')
+    else:
+        plt.savefig(f'{VIZ_PATH}/viz_{key1}_{key2}.jpg')
 
 # --------------------------------------------------------------------- #
 # My own code for model training
@@ -267,6 +396,9 @@ def train(resume=None):
     tag_filtered_path = 'tag_filtered.csv'
     img_data_path = 'Photo_new'
 
+    checkpoint = None
+    if resume is not None:
+        checkpoint = torch.load(resume)
 
     # Configure image transformation for resnet model
     transform = tv.transforms.Compose([
@@ -290,6 +422,9 @@ def train(resume=None):
     model = tv.models.resnet50(pretrained=True, progress=True)
     model = ResNetWrapper(backbone=model, n_cls=len(unique_tags))
 
+    if resume is not None:
+        model.load_state_dict(checkpoint['model_state_dict'])
+
     # Configure loss function / optimizer / scheduler / training scheme
     cls_loss = nn.CrossEntropyLoss()
     contrastive_loss = MultiContrastiveLoss()
@@ -302,6 +437,10 @@ def train(resume=None):
     optimizer = torch.optim.SGD(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[40, 80], gamma=0.5)
 
+    if resume is not None:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
     # Training
     
     onehot = ClsOneHot(tag_list=list(set(tag_table.values[:, 1])))
@@ -312,6 +451,7 @@ def train(resume=None):
 
     for epoch_ in range(epoch):
         epoch_loss = [0, 0]
+        
         for i, (imgs, tags) in tqdm(enumerate(dataloader)):
             imgs = imgs.to(DEVICE)
             gt_cls = onehot.convert(tags)
@@ -342,7 +482,11 @@ def train(resume=None):
         scheduler.step()
 
         if epoch_ and epoch_ % save_period == 0:
-            torch.save(model.state_dict(), f'model_{epoch_}.pth')
+            torch.save({'model_state_dict':model.state_dict(),
+                        'epoch': epoch_,
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict()}, 
+                        f'model_{epoch_}.pth')
 
     return model
 
@@ -367,7 +511,7 @@ def test(trained_model=None, load=False):
         tv.transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
     ])
 
-    test_dataset = BD_TestDataset(img_data_path, tag_n_photoid, transforms=transform)
+    test_dataset = BD_TestDataset(img_data_path, tag_n_photoid, transforms=transform, mode='SAME')
 
 
     # Load trained model
@@ -383,16 +527,31 @@ def test(trained_model=None, load=False):
 
     for i in range(len(test_dataset)):
         test_imgs, test_names, test_key = test_dataset[i]
+        test_imgs = torch.stack(test_imgs)
         test_imgs = test_imgs.to(DEVICE)
         eval_feats, _ = model(test_imgs)
-        topk_dist, topk_pair = compute_distance(eval_feats, 
+        topk_dist, topk_pair = compute_distance_same(eval_feats, 
                                                 k= 4 if len(test_imgs) >= 4 else len(test_imgs) -1)
 
-        if len(topk_dist) == 4:
-            visualize_imgs(test_names, topk_pair)
+        visualize_imgs(test_names, topk_pair, data_path=img_data_path, key=test_key)
                 
         logger.info(f'EVAL {test_key} : {topk_dist.values}  PAIR : {topk_pair}')
 
+    test_dataset.mode = 'DIFF'
+
+    for i in range(len(test_dataset)):
+        anchor_imgs, negative_imgs, anchor_names, negative_names, anchor_key, negative_key = test_dataset[i]
+        anchor_imgs = anchor_imgs.to(DEVICE)
+        negative_imgs = negative_imgs.to(DEVICE)
+        anchor_feats, _ = model(anchor_imgs)
+        negative_feats, _ = model(negative_imgs)
+        topk_dist, topk_pair, diff_mean, diff_std = compute_distance_diff(anchor_feats, negative_feats, \
+            k=4 if min(len(anchor_imgs), len(negative_imgs)) >= 4 else min(len(anchor_imgs), len(negative_imgs)))
+        
+
+        visualize_imgs2(anchor_names, negative_names, topk_pair, data_path=img_data_path, key1=anchor_key, key2=negative_key)
+
+        logger.info(f'EVAL {anchor_key} vs {negative_key} :: MEAN = {diff_mean} STD = {diff_std}')
 
 
 
@@ -406,13 +565,14 @@ if __name__ == "__main__":
     opt = parser.parse_args()
 
     if opt.train:
+        resume = None
         if opt.load:
             # TODO : resume training 
-            pass
-        model_ = train()
+            resume = opt.load
+        model_ = train(resume)
+
     if opt.eval:
         state_dict=False
         if opt.load:
             state_dict = torch.load(opt.load, map_location=DEVICE)
         test(trained_model=None, load=state_dict)
-    
