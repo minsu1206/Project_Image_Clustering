@@ -1,6 +1,5 @@
 from copy import deepcopy
 import json
-from pydoc import apropos
 import torch
 import torch.nn as nn
 import torchvision as tv
@@ -22,7 +21,7 @@ import matplotlib.pyplot as plt
 
 DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 # 1. GTX 1060 6GB
-# 2. GTX 3070Ti 8GB
+# 2. GTX 3070 8GB
 
 import logging
 
@@ -451,7 +450,6 @@ def train(resume=None):
 
     for epoch_ in range(epoch):
         epoch_loss = [0, 0]
-        
         for i, (imgs, tags) in tqdm(enumerate(dataloader)):
             imgs = imgs.to(DEVICE)
             gt_cls = onehot.convert(tags)
