@@ -1,6 +1,5 @@
 from copy import deepcopy
 import json
-from pydoc import apropos
 import torch
 import torch.nn as nn
 import torchvision as tv
@@ -15,13 +14,19 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from random import sample
 import matplotlib.pyplot as plt
+import gc
+gc.collect()
+
 
 # --------------------------------------------------------------------- #
 # Global Level Setting
 # --------------------------------------------------------------------- #
 
 DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-# GTX 1060 6GB
+torch.cuda.empty_cache()
+
+# 1. GTX 1060 6GB / RAM 16GB
+# 2. GTX 3070 8GB / RAM 32GB
 
 import logging
 
@@ -47,12 +52,12 @@ logger = get_logger()
 
 # --------------------------------------------------------------------- #
 # My own class & method 
+# - Dataset
 # --------------------------------------------------------------------- #
 
 class BD_Dataset(Dataset):
     def __init__(self, data_path, img_tag_table, img_coords_table, transforms=None):
         super().__init__()
-        # self.images = list(glob.glob(os.path.join(data_path, '*.jpg')))
         self.data_path = data_path
         self.img_tag_table = img_tag_table
         self.img_coords_table = img_coords_table
@@ -69,7 +74,6 @@ class BD_Dataset(Dataset):
         coords = (round(coords_table_row['longitude'],5), round(coords_table_row['latitude'],5))
         img_path = os.path.join(self.data_path, str(int(img_id)) + '.jpg')
         
-
         try:
             img = cv2.imread(img_path, cv2.IMREAD_COLOR)
             
@@ -88,41 +92,121 @@ class BD_Dataset(Dataset):
 
 
 class BD_TestDataset(Dataset):
-    def __init__(self, data_path, tag_img_dict, transforms=None):
+    # TODO : 
+    # [x] diff among same class 
+    # [x] diff btw two classes 
+    def __init__(self, data_path, tag_img_dict, transforms=None, batch=16, mode='SAME'):
         super().__init__()
         self.data_path = data_path
         self.tag_img_dict = tag_img_dict        
         self.transforms = transforms
+        self.buffer = None
+        self.batch = batch 
+        assert mode in ['SAME', 'DIFF']
+        self.mode = mode
 
     def __len__(self):
         return len(list(self.tag_img_dict.keys()))
 
     def __getitem__(self, idx):
-        
-        key = list(self.tag_img_dict.keys())[idx]
+        if self.mode == 'SAME':
+            # Solve Memory problem --> Set buffer and slice! 
+            if self.buffer is None:
+                key = list(self.tag_img_dict.keys())[idx]
 
-        img_names = self.tag_img_dict[key]
+                img_names = self.tag_img_dict[key]
+                if len(img_names) > self.batch:     #set buffer
+                    self.buffer = {"img":img_names[self.batch:], "key": key}
+                    img_names = img_names[:self.batch]
+                else:
+                    self.buffer = None
+            else:
+                img_names = self.buffer['img'][:self.batch]
+                key = self.buffer["key"]
+                if len(self.buffer["img"]) <= self.batch:
+                    self.buffer = None
+                else:
+                    self.buffer["img"] = self.buffer["img"][self.batch:]
 
-        imgs = []
-        imgs_names = []
-        for img_name in img_names:
-            img = cv2.imread(self.data_path, img_name + '.jpg')
-            if img is None:
-                continue
+            # prepare data
+            imgs_names = []
+            imgs = []
+            for img_name in img_names:
+                img = cv2.imread(os.path.join(self.data_path, str(img_name) + '.jpg'), cv2.IMREAD_COLOR)
+                if img is None:
+                    continue
+                
+                img = Image.fromarray(np.uint8(img)).convert('RGB')
+
+                if self.transforms is not None:
+                    img = self.transforms(img)
+                
+                imgs_names.append(str(img_name) + '.jpg')
+                imgs.append(img)
             
-            img = Image.fromarray(np.uint8(img)).convert('RGB')
-
-            if self.transforms is not None:
-                img = self.transforms(img)
-            
-            imgs_names.append(img_name + '.jpg')
-            imgs.append(img)
-        
-        if self.transforms is not None:
-            return torch.tensor(imgs), imgs_names, key
-        else:
             return imgs, imgs_names, key
 
+        elif self.mode == 'DIFF':
+            
+            # 1st class (anchor) images selection
+            anchor_key = list(self.tag_img_dict.keys())[idx]
+            anchor_img_names = self.tag_img_dict[anchor_key]
+
+            if len(anchor_img_names) > int(self.batch // 2):
+                anchor_img_names = sample(anchor_img_names, self.batch // 2)
+            else:
+                pass
+
+            # 2nd class (negative) images selection
+            sampling = list(self.tag_img_dict.keys()).remove(anchor_key)
+            negative_key = sample(sampling, 1)
+            negative_img_names = self.tag_img_dict[negative_key]
+            
+            if len(negative_img_names) > int(self.batch // 2):
+                negative_img_names = sample(negative_img_names, self.batch // 2)
+            else:
+                pass
+
+            # prepare anchor data
+            anchor_imgs_names = []
+            anchor_imgs = []
+            for img_name in anchor_img_names:
+                img = cv2.imread(os.path.join(self.data_path, str(img_name) + '.jpg'), cv2.IMREAD_COLOR)
+                if img is None:
+                    continue
+                    
+                img = Image.fromarray(np.uint8(img)).convert('RGB')
+
+                if self.transforms is not None:
+                    img = self.transforms(img)
+                
+                anchor_imgs_names.append(str(img_name) + '.jpg')
+                anchor_imgs.append(img)
+
+            # prepare negative data
+            negative_imgs_names = []
+            negative_imgs = []
+            for img_name in negative_img_names:
+                img = cv2.imread(os.path.join(self.data_path, str(img_name) + '.jpg'), cv2.IMREAD_COLOR)
+                if img is None:
+                    continue
+                    
+                img = Image.fromarray(np.uint8(img)).convert('RGB')
+
+                if self.transforms is not None:
+                    img = self.transforms(img)
+
+                negative_imgs_names.append(str(img_name) + '.jpg')
+                negative_imgs.append(img)
+
+
+            return anchor_imgs, negative_imgs, anchor_imgs_names, negative_imgs_names, \
+                    anchor_key, negative_key
+
+# --------------------------------------------------------------------- #
+# My own class & method 
+# - Model
+# --------------------------------------------------------------------- #
 
 class ResNetWrapper(nn.Module):
     def __init__(self, backbone, n_cls):
@@ -155,6 +239,11 @@ class ResNetWrapper(nn.Module):
         cls_vec = self.fc(feat_vec.reshape(x.size(0), -1))
         return feat_vec, cls_vec
 
+
+# --------------------------------------------------------------------- #
+# My own class & method 
+# - Loss
+# --------------------------------------------------------------------- #
 
 class ContrastiveLoss(nn.Module):
     def __init__(self, margin=1.5):
@@ -193,7 +282,34 @@ class MultiContrastiveLoss(nn.Module):
         return loss / self.dim
 
 
-class ClsOneHot:
+class CenterLoss(nn.Module):
+    def __init__(self, n_centers=856, table=None, dim=512):
+        super().__init__()
+        self.cluster_centers = torch.rand(n_centers, dim) * n_centers / dim 
+        self.cluster_centers.to(DEVICE)
+        """
+        Gaussian -> tendency to gather at center
+        Uniform distribution is better at this situation
+        """
+        self.center_table = table
+        self.mse = nn.MSELoss()
+
+    def forward(self, batch_tensors, batch_coords):
+        loss = 0
+        longitude = batch_coords[0]
+        latitude = batch_coords[1]
+        batch_coords = [(i.item(), j.item()) for i, j in zip(longitude, latitude)]
+        for pred, coord in zip(batch_tensors, batch_coords):
+            loss += self.mse(pred, self.cluster_centers[self.center_table.index(coord)].to(DEVICE))
+        return loss / len(batch_tensors)    # divide len of batch_tensors for scalable loss value
+
+
+# --------------------------------------------------------------------- #
+# My own class & method 
+# - Utils
+# --------------------------------------------------------------------- #
+
+class ClsOneHot:    # one-hot vector converter
     def __init__(self, tag_list):
         self.tag_list = tag_list 
     
@@ -204,22 +320,8 @@ class ClsOneHot:
             result.append(self.tag_list.index(x_))
         return torch.tensor(result, dtype=torch.int64).view(-1)
 
-
-class CenterLoss(nn.Module):
-    def __init__(self, n_centers=856, table=None, dim=512):
-        super().__init__()
-        self.cluster_centers = torch.rand(n_centers, dim) * n_centers / dim # uniform distribution
-        # Gaussian -> tendency to gather at center
-        self.center_table = table
-        self.mse = nn.MSELoss()
-
-    def forward(self, batch_tensors, batch_coords):
-        loss = 0
-        for pred, coord in zip(batch_tensors, batch_coords):
-            loss += self.mse(pred, self.cluster_centers[self.center_table.index(coord)])
-        return 
         
-def compute_distance(batch_tensors):
+def compute_distance_same(batch_tensors, k=4):
     batch = batch_tensors.shape[0]
     distance_list = []
     pair_list = []
@@ -228,32 +330,98 @@ def compute_distance(batch_tensors):
         for j in range(i+1, batch):
             compare = batch_tensors[j]
             distance = F.pairwise_distance(anchor, compare)
-            distance_list.append(distance)
+            distance = torch.sqrt(distance.sum())
+            distance_list.append(distance.item())
             pair_list.append((i, j))
+    
+    distance_list = torch.tensor(distance_list)
+    # closest images
+    topk_distance_close = torch.topk(distance_list, k=k, largest=False)
+    topk_pair_close = torch.tensor(pair_list)[topk_distance_close.indices]
 
-    topk_distance = torch.topk(torch.tensor(distance_list), k=4)
-    topk_pair = torch.tensor(pair_list)[topk_distance.indices]
+    return topk_distance_close, topk_pair_close
 
-    return topk_distance, topk_pair
 
-def visualize_imgs(imgs, data_path, key):
-    w = 10
-    h = 10
+def compute_distance_diff(anchor_tensors, negative_tensors, k=4):
+    batch1 = anchor_tensors.shape[0]
+    batch2 = negative_tensors.shape[1]
+
+    distance_list = []
+    pair_list = []
+    for i in range(batch1):
+        anchor = anchor_tensors[i]
+        for j in range(batch2):
+            negative = anchor_tensors[j]
+            distance = F.pairwise_distance(anchor, negative)
+            distance = torch.sqrt(distance.sum())
+            distance_list.append(distance.item())
+            pair_list.append((i, j))
+        
+    distance_list = torch.tensor(distance_list)
+    distance_mean = torch.mean(distance_list)
+    distance_std = torch.mean(distance_list)
+    topk_distance_close = torch.topk(distance_list, k=k, largest=False)
+    topk_pair_close = torch.tensor(pair_list)[topk_distance_close.indices]
+
+    return topk_distance_close, topk_pair_close, distance_mean, distance_std
+
+
+VIZ_PATH = 'visualize'
+
+
+def visualize_imgs(imgs_names, img_pairs, data_path, key):
+
     fig = plt.figure(figsize=(8, 8))
     columns = 2
-    rows = 2
-    for i in range(len(imgs)):
-        img = cv2.imread(os.path.join(data_path, imgs[i]))
-        fig.add_subplot(rows, columns, i)
+    rows = len(img_pairs)
+    for i in range(len(img_pairs)):
+        img = cv2.imread(os.path.join(data_path, imgs_names[img_pairs[i][0]]))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        fig.add_subplot(rows, columns, 2*i+1)
         plt.imshow(img)
-    
+        img = cv2.imread(os.path.join(data_path, imgs_names[img_pairs[i][1]]))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        fig.add_subplot(rows, columns, 2*i+2)
+        plt.imshow(img)
+
     # plt.show()
-    plt.savefig(f'viz_{key}.jpg')
+    if os.path.exists(f'{VIZ_PATH}/viz_{key}.jpg'):
+        count = 2
+        while os.path.exists(f'{VIZ_PATH}/viz_{key}_{count}.jpg'):
+            count += 1
+        plt.savefig(f'{VIZ_PATH}/viz_{key}_{count}.jpg')
+    else:
+        plt.savefig(f'{VIZ_PATH}/viz_{key}.jpg')
+
+def visualize_imgs2(anchor_names, negative_names, img_pairs, data_path, key1, key2):
+
+    fig = plt.figure(figsize=(8, 8))
+    columns = 2
+    rows = len(img_pairs)
+    for i in range(len(img_pairs)):
+        img = cv2.imread(os.path.join(data_path, anchor_names[img_pairs[i][0]]))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        fig.add_subplot(rows, columns, 2*i+1)
+        plt.imshow(img)
+        img = cv2.imread(os.path.join(data_path, negative_names[img_pairs[i][1]]))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        fig.add_subplot(rows, columns, 2*i+2)
+        plt.imshow(img)
+
+    # plt.show()
+    if os.path.exists(f'{VIZ_PATH}/viz_{key1}_{key2}.jpg'):
+        count = 2
+        while os.path.exists(f'{VIZ_PATH}/viz_{key1}_{key2}_{count}.jpg'):
+            count += 1
+        plt.savefig(f'{VIZ_PATH}/viz_{key1}_{key2}_{count}.jpg')
+    else:
+        plt.savefig(f'{VIZ_PATH}/viz_{key1}_{key2}.jpg')
 
 
 # --------------------------------------------------------------------- #
 # My own code for model training
 # --------------------------------------------------------------------- #
+
 
 def train(resume=None):
 
@@ -281,7 +449,7 @@ def train(resume=None):
 
     photo_table = pd.read_csv(filtered_photos, usecols=[1, 2, 3])   # photo_id, longitude, latitude
     coords = photo_table.values[:, [1, 2]]
-    coords_list = [[round(val[0], 5), round(val[1], 5)] for val in coords]
+    coords_list = [(round(val[0], 5), round(val[1], 5)) for val in coords]
     coords_unqiue = []
     for coords in coords_list:
         if coords not in coords_unqiue:
@@ -307,13 +475,15 @@ def train(resume=None):
     # Configure loss function / optimizer / scheduler / training scheme
     cls_loss = nn.CrossEntropyLoss()
     contrastive_loss = MultiContrastiveLoss()
-    center_loss = CenterLoss(n_centers=len(coords_unqiue), table=coords_list, dim=512)
+    center_loss = CenterLoss(n_centers=len(coords_unqiue), table=coords_unqiue, dim=512)
 
     epoch = 120
     lr = 0.0001
-    batch = 24
+    batch = BATCH
     save_period = 10
     log_step = 20
+    balance_weights = [1, 1, 0.5]
+
     optimizer = torch.optim.SGD(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[40, 80], gamma=0.5)
 
@@ -345,7 +515,7 @@ def train(resume=None):
 
             loss3 = center_loss(pred_feat, coords)
 
-            loss = loss1 + loss2 + loss3
+            loss = balance_weights[0] * loss1 + balance_weights[1] * loss2 + balance_weights[2] * loss3
             epoch_loss[0] += loss1.item()
             epoch_loss[1] += loss2.item()
             epoch_loss[2] += loss3.item()
@@ -369,7 +539,7 @@ def train(resume=None):
                         'epoch': epoch_,
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict()}, 
-                        f'model_{epoch_}.pth')
+                        f'model_stage3_{epoch_}.pth')
 
     return model
 
@@ -394,8 +564,7 @@ def test(trained_model=None, load=False):
         tv.transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
     ])
 
-    test_dataset = BD_TestDataset(img_data_path, tag_n_photoid, transforms=transform)
-
+    test_dataset = BD_TestDataset(img_data_path, tag_n_photoid, transforms=transform, batch=BATCH, mode='SAME')
 
     # Load trained model
     if trained_model is not None:
@@ -412,14 +581,28 @@ def test(trained_model=None, load=False):
         test_imgs, test_names, test_key = test_dataset[i]
         test_imgs.to(DEVICE)
         eval_feats, _ = model(test_imgs)
-        topk_dist, topk_pair = compute_distance(eval_feats, k=min(len(test_imgs), 4))
+        topk_dist, topk_pair = compute_distance_same(eval_feats, \
+                                        k= 4 if len(test_imgs) >= 4 else len(test_imgs) -1)
 
-        if len(topk_dist) == 4:
-            visualize_imgs(test_names, topk_pair)
+
+        visualize_imgs(test_names, topk_pair, data_path=img_data_path, key=test_key)
                 
-        logger.info(f'EVAL {test_key} : {topk_dist}')
+        logger.info(f'EVAL {test_key} : {topk_dist.values}  PAIR : {topk_pair}')
 
+    test_dataset.mode = 'DIFF'
 
+    for i in range(len(test_dataset)):
+        anchor_imgs, negative_imgs, anchor_names, negative_names, anchor_key, negative_key = test_dataset[i]
+        anchor_imgs = anchor_imgs.to(DEVICE)
+        negative_imgs = negative_imgs.to(DEVICE)
+        anchor_feats, _ = model(anchor_imgs)
+        negative_feats, _ = model(negative_imgs)
+        topk_dist, topk_pair, diff_mean, diff_std = compute_distance_diff(anchor_feats, negative_feats, \
+            k=4 if min(len(anchor_imgs), len(negative_imgs)) >= 4 else min(len(anchor_imgs), len(negative_imgs)))
+        
+        visualize_imgs2(anchor_names, negative_names, topk_pair, data_path=img_data_path, key1=anchor_key, key2=negative_key)
+
+        logger.info(f'EVAL {anchor_key} vs {negative_key} :: MEAN = {diff_mean} STD = {diff_std}')
 
 
 if __name__ == "__main__":
@@ -428,8 +611,11 @@ if __name__ == "__main__":
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--load', type=str, default='')
+    parser.add_argument('--batch', type=int, default=8)
 
     opt = parser.parse_args()
+
+    BATCH = opt.batch
 
     if opt.train:
         resume = None
